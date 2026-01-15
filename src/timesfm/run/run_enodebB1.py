@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import torch
 from scipy.signal import savgol_filter
 from pathlib import Path
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 # --- CẤU HÌNH ĐƯỜNG DẪN ---
 BASE_DIR = Path("/home/myvh07/hoanglmv/Project/timesfm")
@@ -18,7 +19,7 @@ TARGET_COLS = ['ps_traffic_mb', 'avg_rrc_connected_user', 'prb_dl_used']
 # Cấu hình thời gian
 FREQ = '15min'
 POINTS_PER_DAY = 24 * 4  # 96 điểm dữ liệu một ngày
-CONTEXT_DAYS = 7        # Nhìn lại 14 ngày (Input)
+CONTEXT_DAYS = 14        # Nhìn lại 14 ngày (Input)
 HORIZON_DAYS = 1         # Dự báo 1 ngày tiếp theo (Output)
 
 CONTEXT_LEN = CONTEXT_DAYS * POINTS_PER_DAY
@@ -63,6 +64,24 @@ def smooth_data(df, cols, window_length=11, polyorder=3):
         df_smoothed[col] = np.clip(smoothed_values, a_min=0, a_max=None)
     return df_smoothed
 
+def calculate_metrics(y_true, y_pred):
+    """
+    Tính toán các chỉ số đánh giá: MAE, MAPE, RMSE, Accuracy
+    """
+    # Đảm bảo không chia cho 0 khi tính MAPE
+    epsilon = 1e-10 
+    
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    
+    # MAPE calculation
+    mape = np.mean(np.abs((y_true - y_pred) / (y_true + epsilon))) * 100
+    
+    # Accuracy simple approach: 100% - MAPE (nhưng giới hạn min là 0)
+    accuracy = max(0, 100 - mape)
+    
+    return mae, mape, rmse, accuracy
+
 # --- PHẦN 2: HÀM DỰ BÁO VÀ VẼ HÌNH ---
 
 def run_forecasting_and_plot(df_smoothed, df_raw):
@@ -74,8 +93,7 @@ def run_forecasting_and_plot(df_smoothed, df_raw):
         print(f"LỖI: Dữ liệu không đủ dài. Cần tối thiểu {min_required_len} điểm. Hiện có: {len(df_smoothed)}")
         return
 
-    # --- CẬP NHẬT: TẠO TÊN THƯ MỤC THEO FORMAT YÊU CẦU ---
-    # Format: {Tên Node}_{Số ngày Input}In_{Số ngày Output}Out
+    # --- TẠO TÊN THƯ MỤC THEO FORMAT YÊU CẦU ---
     folder_name = f"{NODE_NAME}_{CONTEXT_DAYS}In_{HORIZON_DAYS}Out"
     save_dir = FIGURE_DIR / folder_name
     
@@ -90,7 +108,6 @@ def run_forecasting_and_plot(df_smoothed, df_raw):
 
     print("Đang tải mô hình TimesFM (PyTorch)...")
     
-    # Kiểm tra GPU
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Sử dụng thiết bị: {device}")
 
@@ -110,18 +127,11 @@ def run_forecasting_and_plot(df_smoothed, df_raw):
     )
 
     # --- Chuẩn bị dữ liệu ---
-    # Cắt lấy đoạn dữ liệu cuối cùng cho cả dữ liệu gốc và dữ liệu mượt
     data_slice_smoothed = df_smoothed.tail(min_required_len)
-    data_slice_raw = df_raw.tail(min_required_len) # Cắt tương ứng để vẽ đối chiếu
+    data_slice_raw = df_raw.tail(min_required_len)
     
-    # Tách tập train (lịch sử) và test (tương lai thực tế)
-    # Input cho model là dữ liệu đã làm mượt
     train_data_smoothed = data_slice_smoothed.iloc[:CONTEXT_LEN]
-    
-    # Dữ liệu để vẽ đối chiếu (Raw History)
     train_data_raw = data_slice_raw.iloc[:CONTEXT_LEN]
-    
-    # Ground Truth (Thực tế tương lai - nên so sánh với Raw thực tế để xem độ chính xác thực)
     actual_future_data = data_slice_raw.iloc[CONTEXT_LEN:]
     
     timestamps_history = train_data_smoothed.index
@@ -141,26 +151,47 @@ def run_forecasting_and_plot(df_smoothed, df_raw):
         
         forecast_values = point_forecast[0]
 
-        # --- Vẽ hình ---
-        plt.figure(figsize=(15, 7))
+        # --- Tính toán Metrics ---
+        # So sánh giữa Dự báo (Forecast) và Thực tế Raw (Actual Future)
+        y_true = actual_future_data[target_col].values
+        y_pred = forecast_values
         
-        # 1. Vẽ dữ liệu GỐC (Lịch sử) - Màu xám nhạt, nằm dưới
+        mae, mape, rmse, accuracy = calculate_metrics(y_true, y_pred)
+        
+        metrics_text = (
+            f"MAE: {mae:.2f}\n"
+            f"RMSE: {rmse:.2f}\n"
+            f"MAPE: {mape:.2f}%\n"
+            f"Accuracy: {accuracy:.2f}%"
+        )
+        print(f"Kết quả: {metrics_text}")
+
+        # --- Vẽ hình ---
+        plt.figure(figsize=(15, 8)) # Tăng chiều cao một chút để chứa text box
+        
+        # 1. Vẽ dữ liệu GỐC (Lịch sử)
         plt.plot(timestamps_history, train_data_raw[target_col], label='Dữ liệu Gốc (Nhiễu)', color='gray', alpha=0.3, linewidth=1)
         
-        # 2. Vẽ dữ liệu ĐÃ LÀM MƯỢT (Lịch sử) - Màu xanh dương đậm
+        # 2. Vẽ dữ liệu ĐÃ LÀM MƯỢT (Lịch sử)
         plt.plot(timestamps_history, train_data_smoothed[target_col], label='Đã làm mượt (Input Model)', color='blue', alpha=0.8, linewidth=1.5)
         
-        # 3. Vẽ dữ liệu THỰC TẾ (Tương lai) - Màu xanh lá
+        # 3. Vẽ dữ liệu THỰC TẾ (Tương lai)
         plt.plot(timestamps_future, actual_future_data[target_col], label='Thực tế (Raw)', color='green', linewidth=2)
         
-        # 4. Vẽ dữ liệu DỰ BÁO - Màu đỏ nét đứt
+        # 4. Vẽ dữ liệu DỰ BÁO
         plt.plot(timestamps_future, forecast_values, label='Dự báo TimesFM', color='red', linestyle='--', linewidth=2.5)
         
         plt.title(f'Dự báo KPI {target_col} - {NODE_NAME}\n(Input: {CONTEXT_DAYS} ngày | Output: {HORIZON_DAYS} ngày)')
         plt.xlabel('Thời gian')
         plt.ylabel('Giá trị')
-        plt.legend()
+        plt.legend(loc='upper left')
         plt.grid(True, linestyle='--', linewidth=0.5)
+        
+        # Thêm hộp thông tin Metrics vào góc màn hình
+        props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+        plt.text(0.02, 0.5, metrics_text, transform=plt.gca().transAxes, fontsize=11,
+                verticalalignment='top', bbox=props)
+
         plt.tight_layout()
         
         file_name = f"{NODE_NAME}_forecast_{target_col}.png"
@@ -175,15 +206,12 @@ if __name__ == "__main__":
         print(f"LỖI: Không tìm thấy file dữ liệu tại {DATA_FILE}")
         exit(1)
         
-    # 1. Load dữ liệu gốc (đã resample/interpolate nhưng chưa smooth)
     df_raw = load_and_preprocess_data(DATA_FILE)
     
-    # 2. Tạo bản sao làm mượt
     if len(df_raw) > 100:
          df_smoothed = smooth_data(df_raw, TARGET_COLS)
     else:
          print("CẢNH BÁO: Dữ liệu quá ngắn, bỏ qua bước làm mượt.")
          df_smoothed = df_raw.copy()
 
-    # 3. Chạy dự báo (truyền cả 2 bản raw và smoothed)
     run_forecasting_and_plot(df_smoothed, df_raw)
